@@ -8,16 +8,51 @@
 #include <Arduino.h>
 
 #include <WiFi.h>
-#include <WiFiMulti.h>
-#include <WiFiClientSecure.h>
+//#include <WiFiClientSecure.h>
 #include <WebSocketsServer.h>
 
-uint16_t isClient = 0;
-float new_measure = 22.5;
-float old_measure = 10;
-uint8_t *payload_buff; 
+#include <Wire.h>
+#include <Adafruit_ADS1015.h>
+#include <math.h>
+#include "filter.h"
 
-WiFiMulti WiFiMulti;
+#ifndef APSSID
+#define APSSID "ESP-EEG_AP1"
+#define APPSK  "12345678"
+#endif
+
+#define measBufLength 16
+
+/* Set these to your desired credentials. */
+const char *ssid = APSSID;
+const char *password = APPSK;
+
+uint16_t isClient = 0;
+float new_measure = -5000;
+float old_measure = 10;
+uint8_t *payload_buff;
+
+// Generally, you should use "unsigned long" for variables that hold time
+// The value will quickly become too large for an int to store
+unsigned long previousMillis = 0;    // will store last time data was updated
+
+// Updates data readings every 4ms
+const long interval = 4;
+
+float buf1_n = 0;
+float buf2_n = 0;
+float x_in_n;
+
+float buf1_hp = 0;
+float buf2_hp = 0;
+float x_in_hp;
+float masterValue;
+float measBuf [16];
+int16_t bufIdx = 0;
+bool bufFull = 0;
+
+Adafruit_ADS1115 ads(0x49);  /* Use this for the 16-bit version */
+
 WebSocketsServer webSocket = WebSocketsServer(81);
 
 void hexdump(const void *mem, uint32_t len, uint8_t cols = 16) {
@@ -63,7 +98,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             // send message to client
             // webSocket.sendBIN(num, payload, length);
             break;
-		case WStype_ERROR:			
+		case WStype_ERROR:
 		case WStype_FRAGMENT_TEXT_START:
 		case WStype_FRAGMENT_BIN_START:
 		case WStype_FRAGMENT:
@@ -74,47 +109,96 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
 }
 
 void setup() {
+	delay(1000);
 
-    Serial.begin(115200);
+	ads.setGain(GAIN_ONE);        // 1x gain   +/- 4.096V  1 bit = 2mV      0.125mV
+  ads.begin();
+	Serial.begin(115200);
 
-    //Serial.setDebugOutput(true);
+  Serial.println();
+  Serial.println();
+  Serial.println();
 
-    Serial.println();
-    Serial.println();
-    Serial.println();
+	Serial.print("Configuring access point...");
+	/* You can remove the password parameter if you want the AP to be open. */
+	WiFi.softAP(ssid, password);
 
-    for(uint8_t t = 4; t > 0; t--) {
-        Serial.printf("[SETUP] BOOT WAIT %d...\n", t);
-        Serial.flush();
-        delay(1000);
-    }
+	IPAddress myIP = WiFi.softAPIP();
+	Serial.print("AP IP address: ");
+	Serial.println(myIP);
 
-    WiFiMulti.addAP("SSID", "passpasspass");
-
-    while(WiFiMulti.run() != WL_CONNECTED) {
-        delay(100);
-    }
-
-    webSocket.begin();
-    webSocket.onEvent(webSocketEvent);
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
 }
 
 void loop() {
-    webSocket.loop();
+	float EEG_value;
+	float EEG_notch_value;
+	float EEG_HP_notch_value;
+  webSocket.loop();
 
-    // if(new_timer  - old_timer> interval )
-    // {
-    //   readSensor();
-    //   filter1();
-    //   new_measure = filter2();
+  unsigned long currentMillis = millis();
+
+	if (currentMillis - previousMillis >= interval) {
+  	previousMillis = currentMillis;
+
+    EEG_value = readMeasure();
+    EEG_notch_value = filterNotch(EEG_value);
+    EEG_HP_notch_value = filterHighPass(EEG_notch_value);
+
+    // measBuf[bufIdx] = EEG_HP_notch_value;
+    masterValue = EEG_HP_notch_value;
+
+    //Serial.println(masterValue);
+
+    // if(bufIdx == measBufLength){
+    //   //snedbuffer
+    //   bufIdx = 0;
+    //   bufFull = 1;
+    //   Serial.println("Buffer Full");
     // }
-    
+		//new_measure = masterValue;
+		new_measure++;
+ }
+
 
     if(isClient) {
       if(new_measure != old_measure){
         payload_buff = (uint8_t*) &new_measure;
-        webSocket.broadcastBIN(payload_buff, sizeof(new_measure)); 
-      } 
+        webSocket.broadcastBIN(payload_buff, sizeof(new_measure));
+      }
     }
+		else {
+			Serial.printf("connection lost");
+		}
     old_measure = new_measure;
+}
+
+float readMeasure()
+{
+  return (float) ads.readADC_SingleEnded(0);
+}
+
+float filterNotch(float x_in_n)
+{
+  float input_acc_n;
+  float output_acc_n;
+
+  input_acc_n = x_in_n-(a1_n*buf1_n)-(a2_n*buf2_n);
+  output_acc_n = input_acc_n*b0_n+(b1_n*buf1_n)+(b2_n*buf2_n);
+  buf2_n = buf1_n;
+  buf1_n = input_acc_n;
+  return output_acc_n;
+}
+
+float filterHighPass(float x_in_hp)
+{
+  float input_acc_hp;
+  float output_acc_hp;
+
+  input_acc_hp = x_in_hp-(a1_hp*buf1_hp)-(a2_hp*buf2_hp);
+  output_acc_hp = input_acc_hp*b0_hp+(b1_hp*buf1_hp)+(b2_hp*buf2_hp);
+  buf2_hp = buf1_hp;
+  buf1_hp = input_acc_hp;
+  return output_acc_hp;
 }
